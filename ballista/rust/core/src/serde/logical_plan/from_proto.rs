@@ -249,6 +249,14 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     PartitionMethod::RoundRobin(batch_size) => {
                         Partitioning::RoundRobinBatch(batch_size as usize)
                     }
+                    PartitionMethod::Columns(protobuf::ColumnsRepartition {
+                        col: pb_cols
+                    }) => Partitioning::Columns(
+                        pb_cols
+                            .iter()
+                            .map(|pb_expr| pb_expr.try_into())
+                            .collect::<Result<Vec<_>, _>>()?
+                    ),
                 };
 
                 LogicalPlanBuilder::from(input)

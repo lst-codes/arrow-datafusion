@@ -928,6 +928,16 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                     Partitioning::RoundRobinBatch(batch_size) => {
                         PartitionMethod::RoundRobin(*batch_size as u64)
                     }
+                    Partitioning::Columns(exprs) => {
+                        let a_expr = exprs
+                            .iter()
+                            .map(|expr| expr.try_into())
+                            .collect::<Result<Vec<_>, BallistaError>>()?;
+
+                        PartitionMethod::Columns(protobuf::ColumnsRepartition {
+                            col: a_expr
+                        })
+                    }
                 };
 
                 Ok(protobuf::LogicalPlanNode {

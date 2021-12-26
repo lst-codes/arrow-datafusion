@@ -672,6 +672,7 @@ impl DefaultPhysicalPlanner {
                                 .collect::<Result<Vec<_>>>()?;
                             Partitioning::Hash(runtime_expr, *n)
                         }
+                        LogicalPartitioning::Columns(_) => todo!(),
                     };
                     Ok(Arc::new(RepartitionExec::try_new(
                         physical_input,

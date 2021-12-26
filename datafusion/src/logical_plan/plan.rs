@@ -555,6 +555,8 @@ pub enum Partitioning {
     /// of partitions.
     /// This partitioning scheme is not yet fully supported. See <https://issues.apache.org/jira/browse/ARROW-11011>
     Hash(Vec<Expr>, usize),
+    /// Allocate rows based on unique combinations of one or more columns
+    Columns(Vec<Expr>)
 }
 
 /// Trait that implements the [Visitor
@@ -969,6 +971,7 @@ impl LogicalPlan {
                                 n
                             )
                         }
+                        Partitioning::Columns(columns) => todo!(),
                     },
                     LogicalPlan::Limit(Limit { ref n, .. }) => write!(f, "Limit: {}", n),
                     LogicalPlan::CreateExternalTable(CreateExternalTable {
