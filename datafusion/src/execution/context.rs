@@ -67,7 +67,6 @@ use crate::logical_plan::{
     LogicalPlanBuilder, UNNAMED_TABLE,
 };
 use crate::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
-use crate::optimizer::constant_folding::ConstantFolding;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
 use crate::optimizer::optimizer::OptimizerRule;
@@ -896,12 +895,13 @@ impl Default for ExecutionConfig {
             target_partitions: num_cpus::get(),
             batch_size: 8192,
             optimizers: vec![
-                Arc::new(ConstantFolding::new()),
+                // Simplify expressions first to maximize the chance
+                // of applying other optimizations
+                Arc::new(SimplifyExpressions::new()),
                 Arc::new(CommonSubexprEliminate::new()),
                 Arc::new(EliminateLimit::new()),
                 Arc::new(ProjectionPushDown::new()),
                 Arc::new(FilterPushDown::new()),
-                Arc::new(SimplifyExpressions::new()),
                 Arc::new(LimitPushDown::new()),
                 Arc::new(SingleDistinctToGroupBy::new()),
             ],
@@ -1843,6 +1843,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_decimal_min() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select min(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| MIN(d_table.c1) |",
+            "+-----------------+",
+            "| -100.009        |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(10, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_max() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+
+        let result = plan_and_collect(&mut ctx, "select max(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| MAX(d_table.c1) |",
+            "+-----------------+",
+            "| 110.009         |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(10, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_sum() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select sum(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| SUM(d_table.c1) |",
+            "+-----------------+",
+            "| 100.000         |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(20, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_avg() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select avg(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| AVG(d_table.c1) |",
+            "+-----------------+",
+            "| 5.0000000       |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(14, 7),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aggregate() -> Result<()> {
         let results = execute("SELECT SUM(c1), SUM(c2) FROM test", 4).await?;
         assert_eq!(results.len(), 1);
@@ -2058,7 +2155,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(results.to_string(), "Error during planning: Coercion from [Timestamp(Nanosecond, None)] to the signature Uniform(1, [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64]) failed.");
+        assert_eq!(results.to_string(), "Error during planning: The function Sum does not support inputs of type Timestamp(Nanosecond, None).");
 
         Ok(())
     }
@@ -2155,7 +2252,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(results.to_string(), "Error during planning: Coercion from [Timestamp(Nanosecond, None)] to the signature Uniform(1, [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64]) failed.");
+        assert_eq!(results.to_string(), "Error during planning: The function Avg does not support inputs of type Timestamp(Nanosecond, None).");
         Ok(())
     }
 

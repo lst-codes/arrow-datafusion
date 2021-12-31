@@ -33,10 +33,10 @@ use crate::logical_plan::{
     DFSchemaRef, DropTable, Expr, LogicalPlan, LogicalPlanBuilder, Operator, PlanType,
     ToDFSchema, ToStringifiedPlan,
 };
-
 use crate::optimizer::utils::exprlist_to_columns;
 use crate::prelude::JoinType;
 use crate::scalar::ScalarValue;
+use crate::sql::utils::make_decimal_type;
 use crate::{
     error::{DataFusionError, Result},
     physical_plan::udaf::AggregateUDF,
@@ -366,15 +366,18 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Maps the SQL type to the corresponding Arrow `DataType`
     fn make_data_type(&self, sql_type: &SQLDataType) -> Result<DataType> {
         match sql_type {
-            SQLDataType::BigInt(_display) => Ok(DataType::Int64),
-            SQLDataType::Int(_display) => Ok(DataType::Int32),
-            SQLDataType::SmallInt(_display) => Ok(DataType::Int16),
+            SQLDataType::BigInt(_) => Ok(DataType::Int64),
+            SQLDataType::Int(_) => Ok(DataType::Int32),
+            SQLDataType::SmallInt(_) => Ok(DataType::Int16),
             SQLDataType::Char(_) | SQLDataType::Varchar(_) | SQLDataType::Text => {
                 Ok(DataType::Utf8)
             }
-            SQLDataType::Decimal(_, _) => Ok(DataType::Float64),
+            SQLDataType::Decimal(precision, scale) => {
+                make_decimal_type(*precision, *scale)
+            }
             SQLDataType::Float(_) => Ok(DataType::Float32),
-            SQLDataType::Real | SQLDataType::Double => Ok(DataType::Float64),
+            SQLDataType::Real => Ok(DataType::Float32),
+            SQLDataType::Double => Ok(DataType::Float64),
             SQLDataType::Boolean => Ok(DataType::Boolean),
             SQLDataType::Date => Ok(DataType::Date32),
             SQLDataType::Time => Ok(DataType::Time64(TimeUnit::Millisecond)),
@@ -655,7 +658,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 return Err(DataFusionError::NotImplemented(format!(
                     "Unsupported ast node {:?} in create_relation",
                     relation
-                )))
+                )));
             }
         };
         if let Some(alias) = alias {
@@ -768,7 +771,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let plan = plan?;
 
         // The SELECT expressions, with wildcards expanded.
-        let select_exprs = self.prepare_select_exprs(&plan, &select.projection)?;
+        let select_exprs = self.prepare_select_exprs(&plan, select)?;
 
         // having and group by clause may reference aliases defined in select projection
         let projected_plan = self.project(plan.clone(), select_exprs.clone())?;
@@ -899,10 +902,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     fn prepare_select_exprs(
         &self,
         plan: &LogicalPlan,
-        projection: &[SelectItem],
+        select: &Select,
     ) -> Result<Vec<Expr>> {
         let input_schema = plan.schema();
-
+        let projection = &select.projection;
         projection
             .iter()
             .map(|expr| self.sql_select_to_rex(expr, input_schema))
@@ -910,7 +913,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             .into_iter()
             .map(|expr| {
                 Ok(match expr {
-                    Expr::Wildcard => expand_wildcard(input_schema, plan)?,
+                    Expr::Wildcard => {
+                        if select.from.is_empty() {
+                            return Err(DataFusionError::Plan(
+                                "SELECT * with no tables specified is not valid"
+                                    .to_string(),
+                            ));
+                        }
+                        expand_wildcard(input_schema, plan)?
+                    }
                     _ => vec![normalize_col(expr, plan)?],
                 })
             })
@@ -1026,14 +1037,43 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     /// convert sql OrderByExpr to Expr::Sort
     fn order_by_to_sort_expr(&self, e: &OrderByExpr, schema: &DFSchema) -> Result<Expr> {
+        let OrderByExpr {
+            asc,
+            expr,
+            nulls_first,
+        } = e;
+
+        let expr = match &expr {
+            SQLExpr::Value(Value::Number(v, _)) => {
+                let field_index = v
+                    .parse::<usize>()
+                    .map_err(|err| DataFusionError::Plan(err.to_string()))?;
+
+                if field_index == 0 {
+                    return Err(DataFusionError::Plan(
+                        "Order by index starts at 1 for column indexes".to_string(),
+                    ));
+                } else if schema.fields().len() < field_index {
+                    return Err(DataFusionError::Plan(format!(
+                        "Order by column out of bounds, specified: {}, max: {}",
+                        field_index,
+                        schema.fields().len()
+                    )));
+                }
+
+                let field = schema.field(field_index - 1);
+                Expr::Column(field.qualified_column())
+            }
+            e => self.sql_expr_to_logical_expr(e, schema)?,
+        };
         Ok({
-            let asc = e.asc.unwrap_or(true);
+            let asc = asc.unwrap_or(true);
             Expr::Sort {
-                expr: Box::new(self.sql_expr_to_logical_expr(&e.expr, schema)?),
+                expr: Box::new(expr),
                 asc,
                 // when asc is true, by default nulls last to be consistent with postgres
                 // postgres rule: https://www.postgresql.org/docs/current/queries-order.html
-                nulls_first: e.nulls_first.unwrap_or(!asc),
+                nulls_first: nulls_first.unwrap_or(!asc),
             }
         })
     }
@@ -1192,14 +1232,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 match expr {
                     // optimization: if it's a number literal, we apply the negative operator
                     // here directly to calculate the new literal.
-                    SQLExpr::Value(Value::Number(n,_)) => match n.parse::<i64>() {
+                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
                         Ok(n) => Ok(lit(-n)),
                         Err(_) => Ok(lit(-n
                             .parse::<f64>()
                             .map_err(|_e| {
                                 DataFusionError::Internal(format!(
                                     "negative operator can be only applied to integer and float operands, got: {}",
-                                n))
+                                    n))
                             })?)),
                     },
                     // not a literal, apply negative operator on expression
@@ -1282,9 +1322,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     let var_names = vec![id.value.clone()];
                     Ok(Expr::ScalarVariable(var_names))
                 } else {
-                    // create a column expression based on raw user input, this column will be
-                    // normalized with qualifer later by the SQL planner.
-                    Ok(col(&id.value))
+                    // Don't use `col()` here because it will try to
+                    // interpret names with '.' as if they were
+                    // compound indenfiers, but this is not a compound
+                    // identifier. (e.g. it is "foo.bar" not foo.bar)
+                    Ok(Expr::Column(Column {
+                        relation: None,
+                        name: id.value.clone(),
+                    }))
                 }
             }
 
@@ -1300,22 +1345,25 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
 
             SQLExpr::CompoundIdentifier(ids) => {
-                let mut var_names = vec![];
-                for id in ids {
-                    var_names.push(id.value.clone());
-                }
+                let mut var_names: Vec<_> =
+                    ids.iter().map(|id| id.value.clone()).collect();
+
                 if &var_names[0][0..1] == "@" {
                     Ok(Expr::ScalarVariable(var_names))
-                } else if var_names.len() == 2 {
-                    // table.column identifier
-                    let name = var_names.pop().unwrap();
-                    let relation = Some(var_names.pop().unwrap());
-                    Ok(Expr::Column(Column { relation, name }))
                 } else {
-                    Err(DataFusionError::NotImplemented(format!(
-                        "Unsupported compound identifier '{:?}'",
-                        var_names,
-                    )))
+                    match (var_names.pop(), var_names.pop()) {
+                        (Some(name), Some(relation)) if var_names.is_empty() => {
+                            // table.column identifier
+                            Ok(Expr::Column(Column {
+                                relation: Some(relation),
+                                name,
+                            }))
+                        }
+                        _ => Err(DataFusionError::NotImplemented(format!(
+                            "Unsupported compound identifier '{:?}'",
+                            var_names,
+                        ))),
+                    }
                 }
             }
 
@@ -1511,7 +1559,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             } else {
                                 Ok(window_frame)
                             }
-
                         })
                         .transpose()?;
                     let fun = window_functions::WindowFunction::from_str(&name)?;
@@ -1540,7 +1587,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                                 fun: window_functions::WindowFunction::BuiltInWindowFunction(
                                     window_fun,
                                 ),
-                                args:self.function_args_to_expr(function, schema)?,
+                                args: self.function_args_to_expr(function, schema)?,
                                 partition_by,
                                 order_by,
                                 window_frame,
@@ -1685,7 +1732,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     return Err(DataFusionError::SQL(ParserError(format!(
                         "Unsupported Interval Expression with value {:?}",
                         value
-                    ))))
+                    ))));
                 }
             };
 
@@ -1985,17 +2032,19 @@ fn extract_possible_join_keys(
 }
 
 /// Convert SQL data type to relational representation of data type
-pub fn convert_data_type(sql: &SQLDataType) -> Result<DataType> {
-    match sql {
+pub fn convert_data_type(sql_type: &SQLDataType) -> Result<DataType> {
+    match sql_type {
         SQLDataType::Boolean => Ok(DataType::Boolean),
-        SQLDataType::SmallInt(_display) => Ok(DataType::Int16),
-        SQLDataType::Int(_display) => Ok(DataType::Int32),
-        SQLDataType::BigInt(_display) => Ok(DataType::Int64),
-        SQLDataType::Float(_) | SQLDataType::Real => Ok(DataType::Float64),
+        SQLDataType::SmallInt(_) => Ok(DataType::Int16),
+        SQLDataType::Int(_) => Ok(DataType::Int32),
+        SQLDataType::BigInt(_) => Ok(DataType::Int64),
+        SQLDataType::Float(_) => Ok(DataType::Float32),
+        SQLDataType::Real => Ok(DataType::Float32),
         SQLDataType::Double => Ok(DataType::Float64),
         SQLDataType::Char(_) | SQLDataType::Varchar(_) => Ok(DataType::Utf8),
         SQLDataType::Timestamp => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         SQLDataType::Date => Ok(DataType::Date32),
+        SQLDataType::Decimal(precision, scale) => make_decimal_type(*precision, *scale),
         other => Err(DataFusionError::NotImplemented(format!(
             "Unsupported SQL type {:?}",
             other
@@ -2005,17 +2054,28 @@ pub fn convert_data_type(sql: &SQLDataType) -> Result<DataType> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use functions::ScalarFunctionImplementation;
+
     use crate::datasource::empty::EmptyTable;
     use crate::physical_plan::functions::Volatility;
     use crate::{logical_plan::create_udf, sql::parser::DFParser};
-    use functions::ScalarFunctionImplementation;
+
+    use super::*;
 
     #[test]
     fn select_no_relation() {
         quick_test(
             "SELECT 1",
             "Projection: Int64(1)\
+             \n  EmptyRelation",
+        );
+    }
+
+    #[test]
+    fn test_real_f32() {
+        quick_test(
+            "SELECT CAST(1.1 AS REAL)",
+            "Projection: CAST(Float64(1.1) AS Float32)\
              \n  EmptyRelation",
         );
     }
@@ -2786,6 +2846,7 @@ mod tests {
              \n    TableScan: person projection=None",
         )
     }
+
     #[test]
     fn select_simple_aggregate_with_groupby_non_column_expression_unselected() {
         quick_test(
@@ -2957,6 +3018,46 @@ mod tests {
             \n  Filter: #aggregate_test_100.c3 > Float64(0.1) AND #aggregate_test_100.c4 > Int64(0)\
             \n    TableScan: aggregate_test_100 projection=None";
         quick_test(sql, expected);
+    }
+
+    #[test]
+    fn select_order_by_index() {
+        let sql = "SELECT id FROM person ORDER BY 1";
+        let expected = "Sort: #person.id ASC NULLS LAST\
+                        \n  Projection: #person.id\
+                        \n    TableScan: person projection=None";
+
+        quick_test(sql, expected);
+    }
+
+    #[test]
+    fn select_order_by_multiple_index() {
+        let sql = "SELECT id, state, age FROM person ORDER BY 1, 3";
+        let expected = "Sort: #person.id ASC NULLS LAST, #person.age ASC NULLS LAST\
+                        \n  Projection: #person.id, #person.state, #person.age\
+                        \n    TableScan: person projection=None";
+
+        quick_test(sql, expected);
+    }
+
+    #[test]
+    fn select_order_by_index_of_0() {
+        let sql = "SELECT id FROM person ORDER BY 0";
+        let err = logical_plan(sql).expect_err("query should have failed");
+        assert_eq!(
+            "Plan(\"Order by index starts at 1 for column indexes\")",
+            format!("{:?}", err)
+        );
+    }
+
+    #[test]
+    fn select_order_by_index_oob() {
+        let sql = "SELECT id FROM person ORDER BY 2";
+        let err = logical_plan(sql).expect_err("query should have failed");
+        assert_eq!(
+            "Plan(\"Order by column out of bounds, specified: 2, max: 1\")",
+            format!("{:?}", err)
+        );
     }
 
     #[test]
